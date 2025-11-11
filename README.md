@@ -1,4 +1,3 @@
-````markdown
 # Foundry
 
 A fast, flexible CLI to manage project templates and scaffold new projects with smart detection, interactive selection, and safe copy semantics.
