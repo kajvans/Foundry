@@ -28,6 +28,7 @@ type Config struct {
 	InstalledLanguages       []string `yaml:"installed_languages"`
 	InstalledPackageManagers []string `yaml:"installed_package_managers"`
 	InstalledDevTools        []string `yaml:"installed_dev_tools"`
+	VSCodePath               string   `yaml:"vscode_path,omitempty"`
 
 	// Saved templates
 	Templates []Template `yaml:"templates,omitempty"`
@@ -63,7 +64,7 @@ func InitConfig() {
 		defaultCfg := &Config{
 			Author:                   "Your Name",
 			License:                  "MIT",
-			DefaultLanguage:          "en",
+			DefaultLanguage:          "",
 			Docker:                   false,
 			Interactive:              true,
 			InstalledLanguages:       []string{},
@@ -71,6 +72,7 @@ func InitConfig() {
 			InstalledDevTools:        []string{},
 			Templates:                []Template{},
 			LanguageDefaults:         make(map[string]string),
+			VSCodePath:               "",
 		}
 		if err := SaveConfig(defaultCfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
@@ -131,6 +133,7 @@ func LoadConfig() (*Config, error) {
 		InstalledDevTools:        []string{},
 		Templates:                []Template{},
 		LanguageDefaults:         make(map[string]string),
+		VSCodePath:               "",
 	}
 
 	file, err := os.Open(path)
@@ -211,6 +214,10 @@ func SetConfigValue(key string, value interface{}) error {
 		if v, ok := value.([]string); ok {
 			cfg.InstalledDevTools = v
 		}
+	case "vscode_path":
+		if v, ok := value.(string); ok {
+			cfg.VSCodePath = v
+		}
 	default:
 		return fmt.Errorf("unknown config key: %s", key)
 	}
@@ -241,6 +248,16 @@ func GetConfigValue(key string) (interface{}, error) {
 		return cfg.InstalledPackageManagers, nil
 	case "installed_dev_tools":
 		return cfg.InstalledDevTools, nil
+	case "git":
+		//check if git is inside installed dev tools
+		for _, tool := range cfg.InstalledDevTools {
+			if tool == "git" {
+				return true, nil
+			}
+		}
+		return false, nil
+	case "vscode_path":
+		return cfg.VSCodePath, nil
 	default:
 		return nil, fmt.Errorf("unknown config key: %s", key)
 	}

@@ -1,0 +1,45 @@
+name: 💡 Feature Request
+description: Suggest a new feature or improvement for Foundry
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for contributing an idea!  
+        Before posting, please check existing discussions to avoid duplicates.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Short summary
+      placeholder: A concise description of the feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why is this needed?
+      description: What problem does this solve, or what value does it add?
+      placeholder: It would help because...
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should this feature ideally work?
+      placeholder: Add a flag to...
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or tools you’ve thought about.
+      placeholder: I tried using ...
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Anything else we should know? Screenshots, links, etc.

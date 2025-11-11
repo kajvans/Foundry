@@ -1,6 +1,3 @@
-/*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
-*/
 package cmd
 
 import (
@@ -8,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -17,6 +15,20 @@ import (
 	"github.com/kajvans/foundry/internal/config"
 	"github.com/spf13/cobra"
 )
+
+const (
+	maxBinaryCheckBytes = 8000
+	defaultPageSize     = 10
+)
+
+var ignoredDirs = map[string]bool{
+	"node_modules": true,
+	"vendor":       true,
+	".venv":        true,
+	"dist":         true,
+	"build":        true,
+	".git":         true,
+}
 
 // newCmd represents the new command
 var newCmd = &cobra.Command{
@@ -39,6 +51,9 @@ The command will:
 	# Use a specific saved template
 	foundry new my-app --template react-starter
 
+	# Fetch template from a Git repository
+	foundry new my-project --git https://github.com/user/template-repo
+
 	# Choose target path explicitly
 	foundry new my-project --language Python --path ~/projects
 
@@ -49,215 +64,64 @@ The command will:
 		projectName := args[0]
 		language, _ := cmd.Flags().GetString("language")
 		templateName, _ := cmd.Flags().GetString("template")
+		gitURL, _ := cmd.Flags().GetString("git")
 		targetPath, _ := cmd.Flags().GetString("path")
 		noGit, _ := cmd.Flags().GetBool("no-git")
 		nonInteractive, _ := cmd.Flags().GetBool("non-interactive")
 		varsKV, _ := cmd.Flags().GetStringArray("var")
 
-		// Load config
 		cfg, err := config.LoadConfig()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-			os.Exit(1)
+			exitWithError("Error loading config: %v", err)
 		}
 
-		// Determine which template to use
-		var tmpl *config.Template
+		//check if git exists
+		gitExists, err := config.GetConfigValue("git")
 
-		if templateName != "" {
-			// User specified template directly
-			tmpl, err = config.GetTemplate(templateName)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+		if gitURL != "" && gitExists.(bool) {
+			projectDir := determineProjectDir(projectName, targetPath)
+
+			// Check early if the directory already exists
+			if _, err := os.Stat(projectDir); err == nil {
+				exitWithError("Directory '%s' already exists", projectDir)
 			}
-		} else if language != "" {
-			// User specified language, use default template for that language
-			defaultTmpl, err := config.GetLanguageDefault(language)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-			if defaultTmpl == "" {
-				fmt.Fprintf(os.Stderr, "No default template set for language '%s'\n", language)
-				fmt.Fprintf(os.Stderr, "Set one with: foundry config %s <template-name>\n", language)
-				fmt.Fprintf(os.Stderr, "Or use --template to specify a template directly\n")
-				os.Exit(1)
-			}
-			tmpl, err = config.GetTemplate(defaultTmpl)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+
+			// Clone repository
+			cmd := exec.Command("git", "clone", gitURL, projectDir)
+			if err := cmd.Run(); err != nil {
+				exitWithError("Failed to clone git repository: %v", err)
 			}
 		} else {
-			// No language or template specified, show available options
-			templates, err := config.ListTemplates()
+			// Determine which template to use
+			tmpl := selectTemplate(cfg, templateName, language, nonInteractive)
+
+			// Verify template path exists
+			if _, err := os.Stat(tmpl.Path); os.IsNotExist(err) {
+				exitWithError("Template path no longer exists: %s", tmpl.Path)
+			}
+
+			projectDir := determineProjectDir(projectName, targetPath)
+
+			// Check if target directory already exists
+			if _, err := os.Stat(projectDir); err == nil {
+				exitWithError("Directory '%s' already exists", projectDir)
+			}
+
+			// Parse additional variables
+			extraVars, err := parseVars(varsKV)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				exitWithError("Error parsing --var: %v", err)
 			}
-			if len(templates) == 0 {
-				fmt.Fprintf(os.Stderr, "No templates available. Add one with: foundry template add <name> <path>\n")
-				os.Exit(1)
+
+			// Create project
+			printProjectInfo(projectName, tmpl, projectDir)
+			if err := createProject(tmpl, projectName, projectDir, cfg.Author, extraVars); err != nil {
+				exitWithError("Error creating project: %v", err)
 			}
-			// Interactive selection only if allowed
-			cfgInteractive := cfg.Interactive
-			if !nonInteractive && cfgInteractive {
-				// Step 1: choose language (arrow-key menu)
-				langSet := map[string]struct{}{}
-				for _, t := range templates {
-					if t.Language != "" {
-						langSet[t.Language] = struct{}{}
-					}
-				}
-				langs := make([]string, 0, len(langSet))
-				for l := range langSet {
-					langs = append(langs, l)
-				}
-				sort.Strings(langs)
 
-				if len(langs) == 0 {
-					fmt.Fprintf(os.Stderr, "No languages detected from templates\n")
-					os.Exit(1)
-				}
-
-				pageSize := 10
-				if len(langs) < pageSize {
-					pageSize = len(langs)
-				}
-				var chosenLang string
-				if err := survey.AskOne(&survey.Select{
-					Message:  "Select a language:",
-					Options:  langs,
-					PageSize: pageSize,
-				}, &chosenLang); err != nil {
-					fmt.Fprintf(os.Stderr, "Selection cancelled\n")
-					os.Exit(1)
-				}
-
-				// Step 2: choose template within chosen language
-				var filtered []config.Template
-				for _, t := range templates {
-					if t.Language == chosenLang {
-						filtered = append(filtered, t)
-					}
-				}
-				if len(filtered) == 0 {
-					fmt.Fprintf(os.Stderr, "No templates available for language '%s'\n", chosenLang)
-					os.Exit(1)
-				}
-
-				// Build display labels and prompt
-				labels := make([]string, 0, len(filtered))
-				for _, t := range filtered {
-					label := t.Name
-					if len(config.IsDefaultTemplate(t.Name)) > 0 {
-						label = fmt.Sprintf("%s (default)", t.Name)
-					}
-					labels = append(labels, label)
-				}
-				pageSize = 10
-				if len(labels) < pageSize {
-					pageSize = len(labels)
-				}
-				var selectedLabel string
-				if err := survey.AskOne(&survey.Select{
-					Message:  fmt.Sprintf("Select a %s template:", chosenLang),
-					Options:  labels,
-					PageSize: pageSize,
-				}, &selectedLabel); err != nil {
-					fmt.Fprintf(os.Stderr, "Selection cancelled\n")
-					os.Exit(1)
-				}
-				// Map back to template by stripping " (default)" suffix if present
-				baseName := selectedLabel
-				if idx := strings.Index(selectedLabel, " (default)"); idx >= 0 {
-					baseName = selectedLabel[:idx]
-				}
-				var selected config.Template
-				for _, t := range filtered {
-					if t.Name == baseName {
-						selected = t
-						break
-					}
-				}
-				tmpl, err = config.GetTemplate(selected.Name)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				fmt.Println("Available templates:")
-				for i, t := range templates {
-					defaults := config.IsDefaultTemplate(t.Name)
-					defaultInfo := ""
-					if len(defaults) > 0 {
-						defaultInfo = fmt.Sprintf(" (default for: %v)", defaults)
-					}
-					fmt.Printf("  %d. %s - %s%s\n", i+1, t.Name, t.Language, defaultInfo)
-				}
-				fmt.Fprintf(os.Stderr, "\nPlease specify --language or --template (or enable interactive mode)\n")
-				os.Exit(1)
-			}
+			printSuccessMessage(projectName, projectDir, tmpl.Language, noGit)
 		}
 
-		// Verify template path exists
-		if _, err := os.Stat(tmpl.Path); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Error: Template path no longer exists: %s\n", tmpl.Path)
-			os.Exit(1)
-		}
-
-		// Determine target directory
-		projectDir := projectName
-		if targetPath != "" {
-			projectDir = filepath.Join(targetPath, projectName)
-		}
-
-		// Check if target directory already exists
-		if _, err := os.Stat(projectDir); err == nil {
-			fmt.Fprintf(os.Stderr, "Error: Directory '%s' already exists\n", projectDir)
-			os.Exit(1)
-		}
-
-		// Create project
-		color.Cyan("Creating project '%s' from template '%s'...", projectName, tmpl.Name)
-		fmt.Printf("  Language: %s\n", tmpl.Language)
-		fmt.Printf("  Target: %s\n", projectDir)
-
-		// Parse additional variables from --var key=value
-		extraVars, err := parseVars(varsKV)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing --var: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := createProject(tmpl, projectName, projectDir, cfg.Author, extraVars); err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating project: %v\n", err)
-			os.Exit(1)
-		}
-
-		color.Green("\n✓ Project '%s' created successfully!", projectName)
-		fmt.Printf("  Location: %s\n", projectDir)
-
-		// Initialize git if requested
-		if !noGit {
-			color.Magenta("\nInitializing git repository...")
-			// TODO: Add git init logic
-			color.HiBlack("  (git init not yet implemented)")
-		}
-
-		color.New(color.Bold).Println("\nNext steps:")
-		fmt.Printf("  cd %s\n", projectName)
-		if tmpl.Language == "Go" {
-			fmt.Printf("  go mod tidy\n")
-			fmt.Printf("  go build\n")
-		} else if tmpl.Language == "JavaScript" || tmpl.Language == "TypeScript" || tmpl.Language == "React" {
-			fmt.Printf("  npm install\n")
-			fmt.Printf("  npm run dev\n")
-		} else if tmpl.Language == "Python" {
-			fmt.Printf("  pip install -r requirements.txt\n")
-			fmt.Printf("  python main.py\n")
-		}
 	},
 }
 
@@ -266,10 +130,292 @@ func init() {
 
 	newCmd.Flags().StringP("language", "l", "", "Language/framework to use (uses default template for that language)")
 	newCmd.Flags().StringP("template", "t", "", "Specific template to use")
+	newCmd.Flags().StringP("git", "g", "", "Git repository URL to fetch template from (e.g., https://github.com/user/repo)")
 	newCmd.Flags().StringP("path", "p", "", "Target path for the new project (default: current directory)")
 	newCmd.Flags().Bool("no-git", false, "Skip git initialization")
 	newCmd.Flags().Bool("non-interactive", false, "Do not prompt; require --language or --template")
 	newCmd.Flags().StringArray("var", []string{}, "Template variable in key=value form (repeatable)")
+}
+
+// exitWithError prints error and exits with code 1
+func exitWithError(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+// selectTemplate determines which template to use based on flags and interactive mode
+func selectTemplate(cfg *config.Config, templateName, language string, nonInteractive bool) *config.Template {
+	if templateName != "" {
+		return selectByName(templateName)
+	}
+	if language != "" {
+		return selectByLanguage(language)
+	}
+	return selectInteractively(cfg, nonInteractive)
+}
+
+// selectByName gets template by explicit name
+func selectByName(name string) *config.Template {
+	tmpl, err := config.GetTemplate(name)
+	if err != nil {
+		exitWithError("%v", err)
+	}
+	return tmpl
+}
+
+// selectByLanguage gets default template for a language
+func selectByLanguage(language string) *config.Template {
+	defaultTmpl, err := config.GetLanguageDefault(language)
+	if err != nil {
+		exitWithError("%v", err)
+	}
+	if defaultTmpl == "" {
+		exitWithError("No default template set for language '%s'\nSet one with: foundry config %s <template-name>\nOr use --template to specify a template directly", language, language)
+	}
+	tmpl, err := config.GetTemplate(defaultTmpl)
+	if err != nil {
+		exitWithError("%v", err)
+	}
+	return tmpl
+}
+
+// selectInteractively shows template selection UI or lists available templates
+func selectInteractively(cfg *config.Config, nonInteractive bool) *config.Template {
+	templates, err := config.ListTemplates()
+	if err != nil {
+		exitWithError("%v", err)
+	}
+	if len(templates) == 0 {
+		exitWithError("No templates available. Add one with: foundry template add <name> <path>")
+	}
+
+	if nonInteractive || !cfg.Interactive {
+		listTemplatesAndExit(templates)
+	}
+
+	// Interactive mode: two-step selection
+	chosenLang := selectLanguage(templates)
+	return selectTemplateForLanguage(templates, chosenLang)
+}
+
+// selectLanguage shows language selection menu
+func selectLanguage(templates []config.Template) string {
+	langSet := make(map[string]struct{})
+	for _, t := range templates {
+		if t.Language != "" {
+			langSet[t.Language] = struct{}{}
+		}
+	}
+
+	langs := make([]string, 0, len(langSet))
+	for l := range langSet {
+		langs = append(langs, l)
+	}
+	sort.Strings(langs)
+
+	if len(langs) == 0 {
+		exitWithError("No languages detected from templates")
+	}
+
+	pageSize := min(len(langs), defaultPageSize)
+	var chosenLang string
+	if err := survey.AskOne(&survey.Select{
+		Message:  "Select a language:",
+		Options:  langs,
+		PageSize: pageSize,
+	}, &chosenLang); err != nil {
+		exitWithError("Selection cancelled")
+	}
+	return chosenLang
+}
+
+// selectTemplateForLanguage shows template selection menu for chosen language
+func selectTemplateForLanguage(templates []config.Template, language string) *config.Template {
+	var filtered []config.Template
+	for _, t := range templates {
+		if t.Language == language {
+			filtered = append(filtered, t)
+		}
+	}
+	if len(filtered) == 0 {
+		exitWithError("No templates available for language '%s'", language)
+	}
+
+	labels := make([]string, 0, len(filtered))
+	for _, t := range filtered {
+		label := t.Name
+		if len(config.IsDefaultTemplate(t.Name)) > 0 {
+			label = fmt.Sprintf("%s (default)", t.Name)
+		}
+		labels = append(labels, label)
+	}
+
+	pageSize := min(len(labels), defaultPageSize)
+	var selectedLabel string
+	if err := survey.AskOne(&survey.Select{
+		Message:  fmt.Sprintf("Select a %s template:", language),
+		Options:  labels,
+		PageSize: pageSize,
+	}, &selectedLabel); err != nil {
+		exitWithError("Selection cancelled")
+	}
+
+	// Strip " (default)" suffix
+	baseName := strings.TrimSuffix(selectedLabel, " (default)")
+	for _, t := range filtered {
+		if t.Name == baseName {
+			tmpl, err := config.GetTemplate(t.Name)
+			if err != nil {
+				exitWithError("%v", err)
+			}
+			return tmpl
+		}
+	}
+	exitWithError("Template not found")
+	return nil
+}
+
+// listTemplatesAndExit lists all templates and exits
+func listTemplatesAndExit(templates []config.Template) {
+	fmt.Println("Available templates:")
+	for i, t := range templates {
+		defaults := config.IsDefaultTemplate(t.Name)
+		defaultInfo := ""
+		if len(defaults) > 0 {
+			defaultInfo = fmt.Sprintf(" (default for: %v)", defaults)
+		}
+		fmt.Printf("  %d. %s - %s%s\n", i+1, t.Name, t.Language, defaultInfo)
+	}
+	exitWithError("Please specify --language or --template (or enable interactive mode)")
+}
+
+// determineProjectDir calculates the target directory for the project
+func determineProjectDir(projectName, targetPath string) string {
+	if targetPath != "" {
+		return filepath.Join(targetPath, projectName)
+	}
+	return projectName
+}
+
+// printProjectInfo displays project creation details
+func printProjectInfo(projectName string, tmpl *config.Template, projectDir string) {
+	color.Cyan("Creating project '%s' from template '%s'...", projectName, tmpl.Name)
+	fmt.Printf("  Language: %s\n", tmpl.Language)
+	fmt.Printf("  Target: %s\n", projectDir)
+}
+
+// printSuccessMessage displays success message and next steps
+func printSuccessMessage(projectName, projectDir, language string, noGit bool) {
+	color.Green("\n✓ Project '%s' created successfully!", projectName)
+	fmt.Printf("  Location: %s\n", projectDir)
+
+	// Setup git repository
+	setupGitRepo(projectDir, noGit, language)
+
+	//TODO: Add code here to open project in VS Code if available
+	vscodePath, err := config.GetConfigValue("vscode_path")
+	if err == nil {
+		if pathStr, ok := vscodePath.(string); ok && pathStr != "" {
+			color.Magenta("\nOpening project in VS Code...")
+			cmd := exec.Command(pathStr, projectDir)
+			if err := cmd.Start(); err != nil {
+				color.Red("✗ Failed to open VS Code: %v", err)
+			} else {
+				color.Green("✓ VS Code opened.")
+			}
+		}
+	}
+
+	color.New(color.Bold).Println("\nNext steps:")
+	fmt.Printf("  cd %s\n", projectName)
+	printLanguageSpecificSteps(language)
+}
+
+func setupGitRepo(projectDir string, noGit bool, language string) error {
+
+	if !noGit {
+		color.Magenta("\nInitializing git repository...")
+		cmd := exec.Command("git", "init", projectDir)
+		if err := cmd.Run(); err != nil {
+			color.Red("✗ Failed to initialize git repository: %v", err)
+		} else {
+			color.Green("✓ Git repository initialized.")
+		}
+
+		//check if gitignore exists in folder
+		if _, err := os.Stat(filepath.Join(projectDir, ".gitignore")); os.IsNotExist(err) {
+			//download default gitignore for language
+			color.Magenta("Adding default .gitignore for %s...", language)
+			gitignoreContent := getDefaultGitignore(language)
+			if gitignoreContent != "" {
+				gitignorePath := filepath.Join(projectDir, ".gitignore")
+				if err := os.WriteFile(gitignorePath, []byte(gitignoreContent), 0644); err != nil {
+					color.Red("✗ Failed to create .gitignore: %v", err)
+				} else {
+					color.Green("✓ .gitignore created.")
+				}
+			} else {
+				color.Yellow("⚠ No default .gitignore available for %s", language)
+			}
+		}
+
+		// 3. Run: git add .
+
+		cmd = exec.Command("git", "-C", projectDir, "add", ".")
+		if err := cmd.Run(); err != nil {
+			color.Red("✗ Failed to add files to git: %v", err)
+		} else {
+			color.Green("✓ Files added to git.")
+		}
+
+		// 4. Run: git commit -m "Initial commit from Foundry"
+		cmd = exec.Command("git", "-C", projectDir, "commit", "-m", "Initial commit from Foundry")
+		if err := cmd.Run(); err != nil {
+			color.Red("✗ Failed to commit files to git: %v", err)
+		} else {
+			color.Green("✓ Initial commit created.")
+		}
+
+	} else {
+		color.Yellow("\n⚠ Git initialization skipped as per --no-git flag.")
+	}
+	return nil
+}
+
+func getDefaultGitignore(language string) string {
+	//download from this link https://raw.githubusercontent.com/github/gitignore/refs/heads/main/$language.gitignore
+	//make first letter uppercase and rest lowercase
+	langFormatted := capitalizeFirst(language)
+	url := fmt.Sprintf("https://raw.githubusercontent.com/github/gitignore/refs/heads/main/%s.gitignore", langFormatted)
+
+	resp, err := exec.Command("curl", "-sL", url).Output()
+	if err != nil {
+		return ""
+	}
+	return string(resp)
+}
+
+// printLanguageSpecificSteps shows commands for specific language
+func printLanguageSpecificSteps(language string) {
+	switch language {
+	case "Go":
+		fmt.Println("  go mod tidy")
+		fmt.Println("  go build")
+	case "JavaScript", "TypeScript", "React":
+		fmt.Println("  npm install")
+		fmt.Println("  npm run dev")
+	case "Python":
+		fmt.Println("  pip install -r requirements.txt")
+		fmt.Println("  python main.py")
+	}
+}
+
+// min returns the smaller of two ints
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // createProject copies the template to the target directory with placeholder replacement
@@ -310,23 +456,17 @@ func createProject(tmpl *config.Template, projectName, targetDir, author string,
 			return err
 		}
 
-		// Skip .git directory
-		if info.IsDir() && info.Name() == ".git" {
+		// Skip ignored directories
+		if info.IsDir() && ignoredDirs[info.Name()] {
 			return filepath.SkipDir
 		}
 
-		// Skip common bulky directories
-		if info.IsDir() {
-			base := info.Name()
-			if base == "node_modules" || base == "vendor" || base == ".venv" || base == "dist" || base == "build" {
-				return filepath.SkipDir
-			}
-		}
-
-		// Skip the target directory (and its children) if it's inside the template path (prevents infinite loop)
+		// Skip the target directory if it's inside the template path (prevents infinite loop)
 		if targetInsideSource {
 			relSrcFromSource, _ := filepath.Rel(absSourceDir, srcPath)
-			if relSrcFromSource == relTarget || strings.HasPrefix(relSrcFromSource+string(os.PathSeparator), relTarget+string(os.PathSeparator)) {
+			isTargetOrChild := relSrcFromSource == relTarget ||
+				strings.HasPrefix(relSrcFromSource+string(os.PathSeparator), relTarget+string(os.PathSeparator))
+			if isTargetOrChild {
 				if info.IsDir() {
 					return filepath.SkipDir
 				}
@@ -357,7 +497,6 @@ func createProject(tmpl *config.Template, projectName, targetDir, author string,
 		dstPath := filepath.Join(targetDir, relPath)
 
 		if info.IsDir() {
-			// Create directory
 			return os.MkdirAll(dstPath, info.Mode())
 		}
 
@@ -370,63 +509,64 @@ func createProject(tmpl *config.Template, projectName, targetDir, author string,
 
 // copyFileWithReplacements copies a file and replaces placeholders
 func copyFileWithReplacements(src, dst, projectName, author string, mode os.FileMode, extraVars map[string]string) error {
-	// Read source file
 	content, err := os.ReadFile(src)
 	if err != nil {
 		return fmt.Errorf("failed to read %s: %w", src, err)
 	}
 
-	// Binary detection: if the first chunk contains NUL, treat as binary and skip replacements
-	if looksBinary(content) {
+	// Skip placeholder replacement for binary files
+	if isBinary(content) {
 		return os.WriteFile(dst, content, mode)
 	}
 
 	// Replace placeholders
-	contentStr := string(content)
-	contentStr = strings.ReplaceAll(contentStr, "{{PROJECT_NAME}}", projectName)
-	contentStr = strings.ReplaceAll(contentStr, "{{AUTHOR}}", author)
-	contentStr = strings.ReplaceAll(contentStr, "{{PROJECT_NAME_LOWER}}", strings.ToLower(projectName))
-	contentStr = strings.ReplaceAll(contentStr, "{{PROJECT_NAME_UPPER}}", strings.ToUpper(projectName))
+	contentStr := replacePlaceholders(string(content), projectName, author, extraVars)
 
-	// Extra variables: replace {{KEY}} with provided values (case-sensitive)
+	return os.WriteFile(dst, []byte(contentStr), mode)
+}
+
+// replacePlaceholders replaces all placeholders in content
+func replacePlaceholders(content, projectName, author string, extraVars map[string]string) string {
+	replacements := map[string]string{
+		"{{PROJECT_NAME}}":       projectName,
+		"{{AUTHOR}}":             author,
+		"{{PROJECT_NAME_LOWER}}": strings.ToLower(projectName),
+		"{{PROJECT_NAME_UPPER}}": strings.ToUpper(projectName),
+	}
+
+	// Add extra variables
 	for k, v := range extraVars {
-		placeholder := "{{" + k + "}}"
-		contentStr = strings.ReplaceAll(contentStr, placeholder, v)
+		replacements["{{"+k+"}}"] = v
 	}
 
-	// Write to destination
-	if err := os.WriteFile(dst, []byte(contentStr), mode); err != nil {
-		return fmt.Errorf("failed to write %s: %w", dst, err)
+	result := content
+	for placeholder, value := range replacements {
+		result = strings.ReplaceAll(result, placeholder, value)
 	}
-
-	return nil
+	return result
 }
 
 // parseVars parses --var key=value entries into a map
 func parseVars(kvs []string) (map[string]string, error) {
-	m := map[string]string{}
+	result := make(map[string]string)
 	for _, kv := range kvs {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) != 2 {
-			return nil, errors.New("invalid var, expected key=value")
+			return nil, fmt.Errorf("invalid var format '%s', expected key=value", kv)
 		}
 		key := strings.TrimSpace(parts[0])
-		val := parts[1]
 		if key == "" {
 			return nil, errors.New("variable key cannot be empty")
 		}
-		m[key] = val
+		result[key] = parts[1]
 	}
-	return m, nil
+	return result, nil
 }
 
-// looksBinary reports whether data likely represents a binary file
-func looksBinary(data []byte) bool {
-	n := len(data)
-	if n > 8000 {
-		n = 8000
-	}
-	for i := 0; i < n; i++ {
+// isBinary reports whether data likely represents a binary file
+func isBinary(data []byte) bool {
+	checkSize := min(len(data), maxBinaryCheckBytes)
+	for i := 0; i < checkSize; i++ {
 		if data[i] == 0 {
 			return true
 		}
@@ -434,17 +574,19 @@ func looksBinary(data []byte) bool {
 	return false
 }
 
-// Local ignore utilities for copy operation (reads template's .foundryignore)
+// loadIgnorePatternsLocal reads .foundryignore from template root
 func loadIgnorePatternsLocal(root string) []string {
-	f, err := os.Open(filepath.Join(root, ".foundryignore"))
+	ignorePath := filepath.Join(root, ".foundryignore")
+	f, err := os.Open(ignorePath)
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
+
 	var patterns []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -453,17 +595,28 @@ func loadIgnorePatternsLocal(root string) []string {
 	return patterns
 }
 
-func matchIgnoreLocal(rel string, patterns []string) bool {
-	r := filepath.ToSlash(rel)
-	for _, p := range patterns {
-		pp := filepath.ToSlash(strings.TrimSuffix(p, "/"))
-		// Glob-like match using simple prefix or exact match
-		if ok, _ := filepath.Match(pp, r); ok {
+// matchIgnoreLocal checks if a relative path matches any ignore pattern
+func matchIgnoreLocal(relPath string, patterns []string) bool {
+	normalizedPath := filepath.ToSlash(relPath)
+	for _, pattern := range patterns {
+		normalizedPattern := filepath.ToSlash(strings.TrimSuffix(pattern, "/"))
+
+		// Try glob match
+		if matched, _ := filepath.Match(normalizedPattern, normalizedPath); matched {
 			return true
 		}
-		if strings.HasPrefix(r+"/", pp+"/") {
+
+		// Try prefix match for directories
+		if strings.HasPrefix(normalizedPath+"/", normalizedPattern+"/") {
 			return true
 		}
 	}
 	return false
+}
+
+func capitalizeFirst(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }

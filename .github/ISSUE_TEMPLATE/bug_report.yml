@@ -1,0 +1,80 @@
+name: 🐛 Bug report
+description: Report something that isn’t working as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file an issue! Please fill out the following details carefully.
+        Incomplete or vague reports will be ignored.
+
+  - type: input
+    id: version
+    attributes:
+      label: Foundry version
+      description: Which version or commit hash are you using?
+      placeholder: e.g. v1.2.3 or commit 9f0e1a2
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: System info
+      description: OS, architecture, and relevant hardware details.
+      placeholder: e.g. Ubuntu 22.04, x86_64, Docker container
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem clearly and precisely.
+      placeholder: The command failed with error code 1 when...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List exact steps so someone else can trigger the same bug.
+      placeholder: |
+        1. Run ...
+        2. Edit ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen instead?
+      placeholder: It should have created the project successfully.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or logs
+      description: Paste logs, stack traces, or console output here.
+      render: shell
+
+  - type: dropdown
+    id: reproducible
+    attributes:
+      label: Reproducibility
+      options:
+        - Always
+        - Sometimes
+        - Rarely
+        - Unable to reproduce
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Anything else worth mentioning? (config files, screenshots, etc.)

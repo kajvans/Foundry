@@ -101,3 +101,5 @@ docker-compose.override.yml
 scripts/
 *.sh
 *.ps1
+
+.github/workflows/
