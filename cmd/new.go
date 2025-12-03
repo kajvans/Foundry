@@ -11,6 +11,7 @@ import (
 	survey "github.com/AlecAivazis/survey/v2"
 	"github.com/fatih/color"
 	"github.com/kajvans/foundry/internal/config"
+	"github.com/kajvans/foundry/internal/post"
 	"github.com/kajvans/foundry/internal/project"
 	"github.com/kajvans/foundry/internal/utils"
 	"github.com/spf13/cobra"
@@ -67,6 +68,7 @@ The command will:
 		gitURL, _ := cmd.Flags().GetString("git")
 		targetPath, _ := cmd.Flags().GetString("path")
 		noGit, _ := cmd.Flags().GetBool("no-git")
+		noPost, _ := cmd.Flags().GetBool("no-post")
 		nonInteractive, _ := cmd.Flags().GetBool("non-interactive")
 		varsKV, _ := cmd.Flags().GetStringArray("var")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -140,7 +142,21 @@ The command will:
 				exitWithError("Error creating project: %v", err)
 			}
 
-			printSuccessMessage(projectName, projectDir, tmpl.Language, noGit)
+			// Run post-create language-specific steps unless disabled or dry-run
+			if !dryRun {
+				if !noPost {
+					color.Magenta("\nRunning language-specific setup...")
+					if err := post.RunLanguagePost(tmpl.Language, projectDir); err != nil {
+						color.Yellow("⚠ Post-create steps failed: %v", err)
+					} else {
+						color.Green("✓ Post-create steps finished.")
+					}
+				} else {
+					color.Yellow("\n⚠ Post-create steps skipped as per --no-post flag.")
+				}
+			}
+
+			printSuccessMessage(projectName, projectDir, tmpl.Language, noGit, noPost)
 		}
 
 	},
@@ -154,6 +170,7 @@ func init() {
 	newCmd.Flags().StringP("git", "g", "", "Git repository URL to fetch template from (e.g., https://github.com/user/repo)")
 	newCmd.Flags().StringP("path", "p", "", "Target path for the new project (default: current directory)")
 	newCmd.Flags().Bool("no-git", false, "Skip git initialization")
+	newCmd.Flags().Bool("no-post", false, "Skip language-specific post-create commands (npm/pip/go)")
 	newCmd.Flags().Bool("non-interactive", false, "Do not prompt; require --language or --template")
 	newCmd.Flags().StringArray("var", []string{}, "Template variable in key=value form (repeatable)")
 	newCmd.Flags().Bool("dry-run", false, "Preview actions without writing files or initializing git")
@@ -327,7 +344,7 @@ func printProjectInfo(projectName string, tmpl *config.Template, projectDir stri
 }
 
 // printSuccessMessage displays success message and next steps
-func printSuccessMessage(projectName, projectDir, language string, noGit bool) {
+func printSuccessMessage(projectName, projectDir, language string, noGit bool, noPost bool) {
 	color.Green("\n✓ Project '%s' created successfully!", projectName)
 	fmt.Printf("  Location: %s\n", projectDir)
 
@@ -348,9 +365,13 @@ func printSuccessMessage(projectName, projectDir, language string, noGit bool) {
 		}
 	}
 
+	//printLanguageSpecificSteps(language)
 	color.New(color.Bold).Println("\nNext steps:")
 	fmt.Printf("  cd %s\n", projectName)
-	printLanguageSpecificSteps(language)
+	if(!noPost){
+		fmt.Printf("  Run the following commands to get started with your %s project:\n", language)
+		printLanguageSpecificSteps(language)
+	}
 }
 
 func setupGitRepo(projectDir string, noGit bool, language string) error {
@@ -429,6 +450,9 @@ func printLanguageSpecificSteps(language string) {
 	case "Python":
 		fmt.Println("  pip install -r requirements.txt")
 		fmt.Println("  python main.py")
+	case "Rust":
+		fmt.Println("  cargo build")
+		fmt.Println("  cargo run")
 	}
 }
 
