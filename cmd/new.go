@@ -1,8 +1,6 @@
 package cmd
 
 import (
-	"bufio"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +11,8 @@ import (
 	survey "github.com/AlecAivazis/survey/v2"
 	"github.com/fatih/color"
 	"github.com/kajvans/foundry/internal/config"
+	"github.com/kajvans/foundry/internal/project"
+	"github.com/kajvans/foundry/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -69,6 +69,7 @@ The command will:
 		noGit, _ := cmd.Flags().GetBool("no-git")
 		nonInteractive, _ := cmd.Flags().GetBool("non-interactive")
 		varsKV, _ := cmd.Flags().GetStringArray("var")
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
 
 		cfg, err := config.LoadConfig()
 		if err != nil {
@@ -108,14 +109,34 @@ The command will:
 			}
 
 			// Parse additional variables
-			extraVars, err := parseVars(varsKV)
+			extraVars, err := utils.ParseVars(varsKV)
 			if err != nil {
 				exitWithError("Error parsing --var: %v", err)
 			}
 
-			// Create project
+			// Create or preview project
 			printProjectInfo(projectName, tmpl, projectDir)
-			if err := createProject(tmpl, projectName, projectDir, cfg.Author, extraVars); err != nil {
+			if dryRun {
+				summary, err := project.PreviewFromTemplate(tmpl, projectName, projectDir, cfg.Author, extraVars)
+				if err != nil {
+					exitWithError("Error previewing project: %v", err)
+				}
+				color.Yellow("\nDry run: no files written, no git init.")
+				fmt.Printf("  Would create %d files:\n", len(summary.Files))
+				// show up to 20 entries
+				maxShow := 20
+				if len(summary.Files) < maxShow {
+					maxShow = len(summary.Files)
+				}
+				for i := 0; i < maxShow; i++ {
+					fmt.Printf("    - %s\n", summary.Files[i])
+				}
+				if len(summary.Files) > maxShow {
+					fmt.Printf("    ... and %d more\n", len(summary.Files)-maxShow)
+				}
+				return
+			}
+			if err := project.CreateFromTemplate(tmpl, projectName, projectDir, cfg.Author, extraVars); err != nil {
 				exitWithError("Error creating project: %v", err)
 			}
 
@@ -135,6 +156,7 @@ func init() {
 	newCmd.Flags().Bool("no-git", false, "Skip git initialization")
 	newCmd.Flags().Bool("non-interactive", false, "Do not prompt; require --language or --template")
 	newCmd.Flags().StringArray("var", []string{}, "Template variable in key=value form (repeatable)")
+	newCmd.Flags().Bool("dry-run", false, "Preview actions without writing files or initializing git")
 }
 
 // exitWithError prints error and exits with code 1
@@ -217,7 +239,7 @@ func selectLanguage(templates []config.Template) string {
 		exitWithError("No languages detected from templates")
 	}
 
-	pageSize := min(len(langs), defaultPageSize)
+	pageSize := utils.Min(len(langs), defaultPageSize)
 	var chosenLang string
 	if err := survey.AskOne(&survey.Select{
 		Message:  "Select a language:",
@@ -250,7 +272,7 @@ func selectTemplateForLanguage(templates []config.Template, language string) *co
 		labels = append(labels, label)
 	}
 
-	pageSize := min(len(labels), defaultPageSize)
+	pageSize := utils.Min(len(labels), defaultPageSize)
 	var selectedLabel string
 	if err := survey.AskOne(&survey.Select{
 		Message:  fmt.Sprintf("Select a %s template:", language),
@@ -385,7 +407,7 @@ func setupGitRepo(projectDir string, noGit bool, language string) error {
 func getDefaultGitignore(language string) string {
 	//download from this link https://raw.githubusercontent.com/github/gitignore/refs/heads/main/$language.gitignore
 	//make first letter uppercase and rest lowercase
-	langFormatted := capitalizeFirst(language)
+	langFormatted := utils.CapitalizeFirst(language)
 	url := fmt.Sprintf("https://raw.githubusercontent.com/github/gitignore/refs/heads/main/%s.gitignore", langFormatted)
 
 	resp, err := exec.Command("curl", "-sL", url).Output()
@@ -410,102 +432,7 @@ func printLanguageSpecificSteps(language string) {
 	}
 }
 
-// min returns the smaller of two ints
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// createProject copies the template to the target directory with placeholder replacement
-func createProject(tmpl *config.Template, projectName, targetDir, author string, extraVars map[string]string) error {
-	// Create target directory
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	// Get absolute paths to avoid issues
-	absTargetDir, err := filepath.Abs(targetDir)
-	if err != nil {
-		return fmt.Errorf("failed to get absolute target path: %w", err)
-	}
-	absSourceDir, err := filepath.Abs(tmpl.Path)
-	if err != nil {
-		return fmt.Errorf("failed to get absolute source path: %w", err)
-	}
-
-	// Resolve symlinks/junctions
-	if realTarget, err := filepath.EvalSymlinks(absTargetDir); err == nil {
-		absTargetDir = realTarget
-	}
-	if realSource, err := filepath.EvalSymlinks(absSourceDir); err == nil {
-		absSourceDir = realSource
-	}
-
-	// Determine if target is inside source tree (copying within same repo)
-	relTarget, relErr := filepath.Rel(absSourceDir, absTargetDir)
-	targetInsideSource := (relErr == nil && !strings.HasPrefix(relTarget, ".."))
-
-	// Load ignore patterns from .foundryignore in template root
-	ignores := loadIgnorePatternsLocal(absSourceDir)
-
-	// Copy files from template
-	err = filepath.Walk(tmpl.Path, func(srcPath string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip ignored directories
-		if info.IsDir() && ignoredDirs[info.Name()] {
-			return filepath.SkipDir
-		}
-
-		// Skip the target directory if it's inside the template path (prevents infinite loop)
-		if targetInsideSource {
-			relSrcFromSource, _ := filepath.Rel(absSourceDir, srcPath)
-			isTargetOrChild := relSrcFromSource == relTarget ||
-				strings.HasPrefix(relSrcFromSource+string(os.PathSeparator), relTarget+string(os.PathSeparator))
-			if isTargetOrChild {
-				if info.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-		}
-
-		// Calculate relative path
-		relPath, err := filepath.Rel(tmpl.Path, srcPath)
-		if err != nil {
-			return err
-		}
-
-		// Apply .foundryignore patterns
-		if matchIgnoreLocal(filepath.ToSlash(relPath), ignores) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Skip the root directory itself
-		if relPath == "." {
-			return nil
-		}
-
-		// Determine destination path
-		dstPath := filepath.Join(targetDir, relPath)
-
-		if info.IsDir() {
-			return os.MkdirAll(dstPath, info.Mode())
-		}
-
-		// Copy file with placeholder replacement
-		return copyFileWithReplacements(srcPath, dstPath, projectName, author, info.Mode(), extraVars)
-	})
-
-	return err
-}
+// ...verplaatst: createProject -> internal/project.CreateFromTemplate
 
 // copyFileWithReplacements copies a file and replaces placeholders
 func copyFileWithReplacements(src, dst, projectName, author string, mode os.FileMode, extraVars map[string]string) error {
@@ -515,108 +442,12 @@ func copyFileWithReplacements(src, dst, projectName, author string, mode os.File
 	}
 
 	// Skip placeholder replacement for binary files
-	if isBinary(content) {
+	if utils.IsBinary(content, maxBinaryCheckBytes) {
 		return os.WriteFile(dst, content, mode)
 	}
 
 	// Replace placeholders
-	contentStr := replacePlaceholders(string(content), projectName, author, extraVars)
+	contentStr := utils.ReplacePlaceholders(string(content), projectName, author, extraVars)
 
 	return os.WriteFile(dst, []byte(contentStr), mode)
-}
-
-// replacePlaceholders replaces all placeholders in content
-func replacePlaceholders(content, projectName, author string, extraVars map[string]string) string {
-	replacements := map[string]string{
-		"{{PROJECT_NAME}}":       projectName,
-		"{{AUTHOR}}":             author,
-		"{{PROJECT_NAME_LOWER}}": strings.ToLower(projectName),
-		"{{PROJECT_NAME_UPPER}}": strings.ToUpper(projectName),
-	}
-
-	// Add extra variables
-	for k, v := range extraVars {
-		replacements["{{"+k+"}}"] = v
-	}
-
-	result := content
-	for placeholder, value := range replacements {
-		result = strings.ReplaceAll(result, placeholder, value)
-	}
-	return result
-}
-
-// parseVars parses --var key=value entries into a map
-func parseVars(kvs []string) (map[string]string, error) {
-	result := make(map[string]string)
-	for _, kv := range kvs {
-		parts := strings.SplitN(kv, "=", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid var format '%s', expected key=value", kv)
-		}
-		key := strings.TrimSpace(parts[0])
-		if key == "" {
-			return nil, errors.New("variable key cannot be empty")
-		}
-		result[key] = parts[1]
-	}
-	return result, nil
-}
-
-// isBinary reports whether data likely represents a binary file
-func isBinary(data []byte) bool {
-	checkSize := min(len(data), maxBinaryCheckBytes)
-	for i := 0; i < checkSize; i++ {
-		if data[i] == 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// loadIgnorePatternsLocal reads .foundryignore from template root
-func loadIgnorePatternsLocal(root string) []string {
-	ignorePath := filepath.Join(root, ".foundryignore")
-	f, err := os.Open(ignorePath)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var patterns []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		patterns = append(patterns, line)
-	}
-	return patterns
-}
-
-// matchIgnoreLocal checks if a relative path matches any ignore pattern
-func matchIgnoreLocal(relPath string, patterns []string) bool {
-	normalizedPath := filepath.ToSlash(relPath)
-	for _, pattern := range patterns {
-		normalizedPattern := filepath.ToSlash(strings.TrimSuffix(pattern, "/"))
-
-		// Try glob match
-		if matched, _ := filepath.Match(normalizedPattern, normalizedPath); matched {
-			return true
-		}
-
-		// Try prefix match for directories
-		if strings.HasPrefix(normalizedPath+"/", normalizedPattern+"/") {
-			return true
-		}
-	}
-	return false
-}
-
-func capitalizeFirst(s string) string {
-	if len(s) == 0 {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
 }
